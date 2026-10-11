@@ -1,0 +1,440 @@
+// Prisma Schema for Computer Stationary and Online Services Shop
+// Optimized for MongoDB Atlas (Replica Set transactions supported)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// 1. EMBEDDED TYPES (Prisma NoSQL Embedded Documents)
+// ==========================================
+
+type Address {
+  street     String?
+  area       String?
+  upazila    String? // Sub-district / Upazila
+  district   String? // District / Zila
+  division   String? // Division
+  postalCode String?
+}
+
+type CustomerDocument {
+  id           String   // UUID / unique identifier
+  title        String   // e.g., "NID Copy - Front", "Birth Certificate Original"
+  documentType String   // e.g., "NID", "BIRTH_CERTIFICATE", "PASSPORT", "OTHER"
+  fileUrl      String   // Public or Presigned Cloudflare R2 URL
+  fileKey      String   // Cloudflare R2 Object Key (e.g., "customers/123/docs/nid.pdf")
+  fileSize     Int?     // Size in bytes
+  mimeType     String?  // e.g., "application/pdf", "image/jpeg"
+  uploadedAt   DateTime @default(now())
+}
+
+type CustomFieldDefinition {
+  fieldId      String   // slug key, e.g., "nid_tracking_number", "slip_no"
+  label        String   // human-readable label, e.g., "Online Slip No"
+  fieldType    String   // "text", "number", "date", "select", "boolean", "textarea"
+  placeholder  String?
+  required     Boolean  @default(false)
+  options      String[] // For "select" field type
+  helpText     String?
+}
+
+type CustomFieldValue {
+  fieldId      String
+  label        String
+  value        String
+}
+
+type OrderAttachment {
+  id           String
+  title        String
+  fileUrl      String
+  fileKey      String
+  fileSize     Int?
+  mimeType     String?
+  uploadedAt   DateTime @default(now())
+}
+
+// ==========================================
+// 2. ENUMS
+// ==========================================
+
+enum RoleType {
+  SUPER_ADMIN // Unrestricted access to all modules, settings & cash actions
+  ADMIN       // Full access except system-level destructive operations
+  STAFF       // Limited to service processing & customer interaction
+  CUSTOM      // Custom role driven by granular permissions
+}
+
+enum Permission {
+  // Service Management
+  SERVICES_VIEW
+  SERVICES_CREATE
+  SERVICES_EDIT
+  SERVICES_DELETE
+
+  // Service Orders & Applications
+  ORDERS_VIEW
+  ORDERS_CREATE
+  ORDERS_UPDATE
+  ORDERS_DELETE
+
+  // Customer Management
+  CUSTOMERS_VIEW
+  CUSTOMERS_CREATE
+  CUSTOMERS_EDIT
+  CUSTOMERS_DELETE
+
+  // Expense Management
+  EXPENSES_VIEW
+  EXPENSES_CREATE
+  EXPENSES_EDIT
+  EXPENSES_DELETE
+
+  // Ledger & Virtual Cash (Sensitive)
+  LEDGER_VIEW
+  LEDGER_MANUAL_ADJUST
+  LEDGER_DEPOSIT
+  LEDGER_WITHDRAW
+
+  // Reports & Analytics
+  ANALYTICS_VIEW
+  EXPORT_DATA
+
+  // System & RBAC
+  USERS_VIEW
+  USERS_MANAGE
+  ROLES_MANAGE
+  SETTINGS_MANAGE
+}
+
+enum OrderStatus {
+  PENDING           // Application submitted, waiting to begin
+  IN_PROGRESS       // Currently processing with govt server / preparing
+  AWAITING_GOVT_DOC // Submitted to portal, waiting for official verification
+  READY_FOR_DELIVERY// Printout / Certificate ready for pickup
+  COMPLETED         // Delivered to customer, fully finalized
+  CANCELLED         // Cancelled / Rejected
+}
+
+enum PaymentStatus {
+  PAID
+  PARTIAL
+  DUE
+}
+
+enum PaymentMethod {
+  CASH
+  BKASH
+  NAGAD
+  ROCKET
+  BANK_TRANSFER
+  OTHER
+}
+
+enum AccountType {
+  CASH_DRAWER // Physical cash in shop counter
+  BKASH       // bKash Merchant / Personal agent wallet
+  NAGAD       // Nagad wallet
+  ROCKET      // Rocket wallet
+  BANK        // Shop Bank Account
+  OTHER       // Other payment gateway / wallet
+}
+
+enum LedgerEntryType {
+  INCOME     // Inflow from service rendered or customer due cleared
+  EXPENSE    // Outflow for shop expense (rent, electricity, printing papers)
+  DEPOSIT    // Manual capital / cash injection by Super Admin
+  WITHDRAWAL // Manual cash withdrawal / profit taking by Super Admin
+  ADJUSTMENT // Manual correction for tallying physical drawer with digital ledger
+  TRANSFER   // Transfer between accounts (e.g. bKash to Cash Drawer)
+}
+
+enum LedgerDirection {
+  INFLOW  // Credit into cash/account (+)
+  OUTFLOW // Debit from cash/account (-)
+}
+
+enum LedgerSource {
+  SERVICE_SALE
+  EXPENSE_PAYMENT
+  CUSTOMER_DUE_PAYMENT
+  MANUAL_DEPOSIT
+  MANUAL_WITHDRAWAL
+  MANUAL_ADJUSTMENT
+  ACCOUNT_TRANSFER
+}
+
+// ==========================================
+// 3. AUTHENTICATION & RBAC MODELS
+// ==========================================
+
+model Role {
+  id          String       @id @default(auto()) @map("_id") @db.ObjectId
+  name        String       @unique
+  code        String       @unique // e.g., "STAFF_OPERATOR", "ACCOUNTS_OFFICER"
+  description String?
+  isSystem    Boolean      @default(false) // System roles cannot be deleted
+  permissions Permission[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  users User[]
+
+  @@map("roles")
+}
+
+model User {
+  id           String       @id @default(auto()) @map("_id") @db.ObjectId
+  name         String
+  email        String       @unique
+  phone        String?
+  passwordHash String
+  roleType     RoleType     @default(STAFF)
+  roleId       String?      @db.ObjectId
+  role         Role?        @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  // Direct permission overrides (additive on top of role)
+  permissions  Permission[]
+  avatarUrl    String?
+  avatarKey    String?      // Cloudflare R2 key
+  isActive     Boolean      @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  // Auditing Relations
+  servedOrders  ServiceOrder[] @relation("OrderServedBy")
+  createdExpenses Expense[]    @relation("ExpenseCreatedBy")
+  ledgerEntries  LedgerEntry[] @relation("LedgerPerformedBy")
+
+  @@map("users")
+}
+
+// ==========================================
+// 4. CUSTOMER MANAGEMENT (CRM + R2 CLOUD VAULT)
+// ==========================================
+
+model Customer {
+  id              String             @id @default(auto()) @map("_id") @db.ObjectId
+  name            String
+  phone           String             // Indexed for fast counter lookup
+  email           String?
+  nidNumber       String?            // National ID (NID) for identity citizen service shops
+  birthRegNumber  String?            // Online Birth Registration Number (BRIS)
+  address         Address?           // Embedded document for location details
+  profilePhotoUrl String?            // Cloudflare R2 URL
+  profilePhotoKey String?            // Cloudflare R2 Key
+  documents       CustomerDocument[] // Embedded R2 document vault (scanned copies, tokens)
+  currentDue      Float              @default(0) // Running customer outstanding balance
+  advanceBalance  Float              @default(0) // Available customer advance credit / deposit
+  notes           String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  // Relations
+  serviceOrders ServiceOrder[]
+  ledgerEntries LedgerEntry[]
+
+  @@index([phone])
+  @@index([nidNumber])
+  @@map("customers")
+}
+
+// ==========================================
+// 5. DYNAMIC SERVICE MANAGEMENT
+// ==========================================
+
+model ServiceCategory {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  name        String    @unique // e.g. "Govt & Citizen Services", "Stationary & Printing", "Education Forms"
+  description String?
+  icon        String?   // Lucide icon name, e.g. "FileText", "Printer"
+  order       Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  services Service[]
+
+  @@map("service_categories")
+}
+
+model Service {
+  id           String                  @id @default(auto()) @map("_id") @db.ObjectId
+  name         String                  // e.g. "NID Application", "Passport Renewal", "Color Printing"
+  code         String                  @unique // e.g. "NID_APP", "PASSPORT_RENEW"
+  description  String?
+  categoryId   String?                 @db.ObjectId
+  category     ServiceCategory?        @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  baseCharge   Float                   // Shop service fee
+  govtFee      Float                   @default(0) // Official portal cost / govt challan fee
+  costPrice    Float                   @default(0) // Physical consumables cost if applicable
+  isActive     Boolean                 @default(true)
+  customFields CustomFieldDefinition[] // Dynamic schema fields required for this service
+  createdAt    DateTime                @default(now())
+  updatedAt    DateTime                @updatedAt
+
+  serviceOrders ServiceOrder[]
+
+  @@map("services")
+}
+
+// ==========================================
+// 6. SERVICE TRANSACTIONS / ORDERS
+// ==========================================
+
+model ServiceOrder {
+  id             String             @id @default(auto()) @map("_id") @db.ObjectId
+  orderNumber    String             @unique // Human-friendly invoice no: "SO-202610-0001"
+  customerId     String             @db.ObjectId
+  customer       Customer           @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  serviceId      String             @db.ObjectId
+  service        Service            @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  // Financial Breakdown
+  baseCharge     Float              // Snapshot of service charge at order time
+  govtFee        Float              @default(0)
+  extraFee       Float              @default(0) // Urgent fees, laminating, paper upgrade
+  discount       Float              @default(0)
+  totalAmount    Float              // (baseCharge + govtFee + extraFee) - discount
+  paidAmount     Float              @default(0)
+  dueAmount      Float              @default(0)
+  
+  // Status & Tracking
+  status         OrderStatus        @default(PENDING)
+  paymentStatus  PaymentStatus      @default(DUE)
+  paymentMethod  PaymentMethod      @default(CASH)
+  accountId      String?            @db.ObjectId // CashAccount receiving the money
+  account        CashAccount?       @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  // Dynamic Service-Specific Fields & Attachments
+  customValues   CustomFieldValue[] // Key-value data collected for this specific order
+  attachments    OrderAttachment[]  // Work-in-progress or delivered docs in Cloudflare R2
+
+  deliveryDate   DateTime?
+  completedAt    DateTime?
+  notes          String?
+
+  // Audit Relations
+  servedById     String?            @db.ObjectId
+  servedBy       User?              @relation("OrderServedBy", fields: [servedById], references: [id], onDelete: SetNull)
+  ledgerEntries  LedgerEntry[]
+
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  @@index([customerId])
+  @@index([serviceId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("service_orders")
+}
+
+// ==========================================
+// 7. EXPENSE MANAGEMENT
+// ==========================================
+
+model ExpenseCategory {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  name        String    @unique // e.g. "Shop Rent", "Electricity Bill", "Internet & Mobile", "Office Supplies"
+  description String?
+  isDefault   Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  expenses Expense[]
+
+  @@map("expense_categories")
+}
+
+model Expense {
+  id            String          @id @default(auto()) @map("_id") @db.ObjectId
+  expenseNumber String          @unique // e.g. "EXP-202610-0001"
+  categoryId    String          @db.ObjectId
+  category      ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  title         String          // e.g. "September Electricity Bill"
+  amount        Float
+  date          DateTime        @default(now())
+  paymentMethod PaymentMethod   @default(CASH)
+  accountId     String?         @db.ObjectId // CashAccount paying this expense
+  account       CashAccount?    @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  receiptUrl    String?         // Cloudflare R2 voucher / invoice photo
+  receiptKey    String?         // Cloudflare R2 key
+  note          String?
+
+  createdById   String          @db.ObjectId
+  createdBy     User            @relation("ExpenseCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  ledgerEntries LedgerEntry[]
+
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([categoryId])
+  @@index([date])
+  @@map("expenses")
+}
+
+// ==========================================
+// 8. VIRTUAL CASH & LEDGER SYSTEM
+// ==========================================
+
+model CashAccount {
+  id             String       @id @default(auto()) @map("_id") @db.ObjectId
+  name           String       // e.g. "Physical Cash Drawer", "bKash Shop Agent", "Nagad Merchant", "City Bank"
+  type           AccountType  @default(CASH_DRAWER)
+  accountNumber  String?      // e.g. mobile wallet number or bank account number
+  currentBalance Float        @default(0) // Current verified balance
+  isDefault      Boolean      @default(false)
+  isActive       Boolean      @default(true)
+  notes          String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  ledgerEntries LedgerEntry[]
+  serviceOrders ServiceOrder[]
+  expenses      Expense[]
+
+  @@map("cash_accounts")
+}
+
+model LedgerEntry {
+  id             String          @id @default(auto()) @map("_id") @db.ObjectId
+  entryNumber    String          @unique // e.g. "LED-202610-0001"
+  
+  accountId      String          @db.ObjectId
+  account        CashAccount     @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  
+  type           LedgerEntryType
+  direction      LedgerDirection // INFLOW (+) or OUTFLOW (-)
+  amount         Float
+  balanceBefore  Float           // Account balance immediately before this transaction
+  balanceAfter   Float           // Account balance immediately after this transaction
+  
+  source         LedgerSource
+  referenceId    String?         // ID of associated ServiceOrder, Expense, or Customer
+  referenceType  String?         // "ServiceOrder", "Expense", "Customer", "Manual"
+  
+  // Specific contextual links (optional relations for fast querying)
+  serviceOrderId String?         @db.ObjectId
+  serviceOrder   ServiceOrder?   @relation(fields: [serviceOrderId], references: [id], onDelete: SetNull)
+  expenseId      String?         @db.ObjectId
+  expense        Expense?        @relation(fields: [expenseId], references: [id], onDelete: SetNull)
+  customerId     String?         @db.ObjectId
+  customer       Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  note           String          // Mandatory explanatory note / audit reason
+  performedById  String          @db.ObjectId
+  performedBy    User            @relation("LedgerPerformedBy", fields: [performedById], references: [id], onDelete: Restrict)
+
+  createdAt      DateTime        @default(now())
+
+  @@index([accountId])
+  @@index([type])
+  @@index([source])
+  @@index([createdAt])
+  @@map("ledger_entries")
+}
